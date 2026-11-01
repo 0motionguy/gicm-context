@@ -1,275 +1,48 @@
 # @gicm/context
 
-> Precision context injection for AI agents — index skills, score relevance per-message, inject within token budget
+Skill-aware context injection: score SKILL.md files against each message and inject only the best matches within a token budget.
 
-## The Problem
+Agents that load every skill into every prompt spend tokens on material the current task never touches. This package indexes your skills once, scores them against each incoming message and builds a prompt from the top few that fit the budget. It is for developers who keep a folder of SKILL.md files and want a small, dependency-light selector in front of them. Scoring is lexical: no embeddings and no network.
 
-AI agents waste 70-90% of context tokens by loading ALL skills/documents into EVERY prompt, even when irrelevant.
+Part of [gICM](https://github.com/0motionguy/gICM), a family of OpenClaw agent packages. API reference and examples: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
-Example: Your agent has 50 skills (200k tokens). User asks "Build a React component". Agent loads all 50 skills, wasting tokens on Solana, Docker, database, etc.
+## What it does
 
-## The Solution
+- **Index:** `indexSkills([{ content, path }])` parses SKILL.md frontmatter (`name`, `version`, `description`, `author`, `tags`) into entries with a token estimate (characters divided by 4). Files without frontmatter are skipped.
+- **Score:** each query word of three letters or more adds 10 for a name match, 5 for a tag match, 3 for a description match and 1 per body occurrence (capped at 3 per word). The boost values are configurable.
+- **Inject:** `inject(message)` ranks the scored skills and takes them in order until `maxSkills` (5 by default) or `maxTokens` (8,000 by default) is reached. A skill that would overflow the budget is skipped in favour of a smaller one.
+- **Result:** the chosen skills with their match reasons, tokens used, the fraction of budget spent and a formatted `## Loaded Context` prompt.
+- **Manage:** add, get, remove and clear helpers, hit counts per skill through `getStats()`, and events `context:indexed`, `context:injected` and `context:budget-exceeded`.
 
-`@gicm/context` is a precision context injection engine:
+## Example
 
-1. **Index once** — Parse all available skills (SKILL.md files)
-2. **Score per-message** — Calculate relevance score for each skill based on query
-3. **Inject top-N** — Load only the most relevant skills, within a token budget
-4. **Save 70-90%** — Skip irrelevant skills entirely
-
-## Installation
-
-```bash
-pnpm add @gicm/context
-```
-
-## Quick Start
-
-```typescript
+```ts
 import { ContextEngine } from "@gicm/context";
 
-// Create engine with token budget
-const engine = new ContextEngine({
-  maxTokens: 8000, // Token budget per message
-  maxSkills: 5, // Max skills to inject
-});
+const engine = new ContextEngine({ maxTokens: 8000, maxSkills: 5 });
+engine.indexSkills([{ content: reactSkillMd, path: "skills/react/SKILL.md" }]);
 
-// Index skills
-engine.indexSkills([
-  { content: reactSkillMd, path: "skills/react.md" },
-  { content: solanaSkillMd, path: "skills/solana.md" },
-  { content: dockerSkillMd, path: "skills/docker.md" },
-]);
-
-// Inject relevant context
-const result = engine.inject("Build a React dashboard component");
-
-console.log(result.skills.map((s) => s.skill.name));
-// ["react-component-builder"] — Only React, skipped Solana/Docker
-
-console.log(result.totalTokens);
-// 2,341 — Saved 80% compared to loading all skills
-
-console.log(result.prompt);
-// Formatted context ready for LLM injection
+const { skills, totalTokens, prompt } = engine.inject("Build a React dashboard");
 ```
 
-## Scoring Algorithm
+## How it's built
 
-Skills are scored by keyword matching with boosted weights:
+TypeScript (ESM) bundled with tsup and tested with vitest; zod validates the config. `parser.ts` is a small line-based frontmatter reader (single-line fields, tags written as `[a, b]`, LF line endings), `scorer.ts` does the keyword scoring and `context-engine.ts` handles the budget and prompt.
 
-| Match Type      | Boost | Example                                        |
-| --------------- | ----- | ---------------------------------------------- |
-| **Name**        | 10x   | "react" matches `react-component-builder`      |
-| **Tag**         | 5x    | "frontend" matches `[frontend, ui, react]` tag |
-| **Description** | 3x    | "component" in description                     |
-| **Content**     | 1x    | Keyword in body (capped at 3x per word)        |
+## Repository layout
 
-Query: `"Build a React component with TypeScript"`
+- `src/`: `context-engine`, `scorer`, `parser`, `types`
+- `src/__tests__/`: vitest suite (30 test cases)
+- `skill/SKILL.md`: the OpenClaw skill definition
 
-- "react" → nameMatch (10) + tagMatch (5) + contentMatch (3) = 18
-- "typescript" → tagMatch (5) + descriptionMatch (3) = 8
-- "component" → descriptionMatch (3) + contentMatch (2) = 5
-
-Total score: **31**
-
-## API Reference
-
-### `ContextEngine`
-
-Main class for context injection.
-
-```typescript
-const engine = new ContextEngine({
-  maxTokens: 8000, // Token budget per injection
-  maxSkills: 5, // Max skills to inject
-  boostFactors: {
-    // Scoring weights
-    nameMatch: 10,
-    tagMatch: 5,
-    descriptionMatch: 3,
-    contentMatch: 1,
-  },
-  excludePatterns: [], // Glob patterns to skip
-});
-```
-
-#### Methods
-
-**`indexSkills(sources: Array<{ content: string; path: string }>): number`**
-
-Index skills from SKILL.md content. Returns count of successfully indexed skills.
-
-```typescript
-const count = engine.indexSkills([{ content: skillMd, path: "react.md" }]);
-```
-
-**`inject(message: string): InjectionResult`**
-
-Inject relevant context for a message.
-
-```typescript
-const result = engine.inject("Build a dashboard");
-// {
-//   skills: [{ skill, score, matchReasons }],
-//   totalTokens: 2341,
-//   budgetUsed: 0.29,
-//   prompt: "## Loaded Context\n\n### react-component-builder..."
-// }
-```
-
-**`getStats(): ContextStats`**
-
-Get indexing statistics.
-
-```typescript
-const stats = engine.getStats();
-// {
-//   totalSkills: 50,
-//   totalTokens: 198431,
-//   lastIndexed: Date,
-//   avgTokensPerSkill: 3968,
-//   topSkills: [{ id: "react-...", hitCount: 47 }]
-// }
-```
-
-**`getSkill(id: string): SkillEntry | undefined`**
-
-Get a specific skill by ID.
-
-**`removeSkill(id: string): boolean`**
-
-Remove a skill from the index.
-
-**`clear(): void`**
-
-Clear all indexed skills.
-
-**`getSkillIds(): string[]`**
-
-Get all indexed skill IDs.
-
-#### Events
-
-```typescript
-engine.on("context:indexed", (count: number) => {
-  console.log(`Indexed ${count} skills`);
-});
-
-engine.on("context:injected", (skills: string[], tokens: number) => {
-  console.log(`Injected ${skills.length} skills (${tokens} tokens)`);
-});
-
-engine.on("context:budget-exceeded", (requested: number, budget: number) => {
-  console.log(`Skipped skill: ${requested} tokens exceeds budget ${budget}`);
-});
-```
-
-## SKILL.md Format
-
-Skills must be valid SKILL.md files with YAML frontmatter:
-
-```markdown
----
-name: react-component-builder
-version: 1.0.0
-description: Build React components with TypeScript and Tailwind
-author: ICM Motion
-tags: [react, typescript, tailwind, frontend]
----
-
-# React Component Builder
-
-Build production-ready React components.
-
-## Patterns
-
-- Use functional components with hooks
-- TypeScript strict mode
-- Tailwind for styling
-```
-
-## Integration with OpenClaw
-
-```typescript
-import { ContextEngine } from "@gicm/context";
-import { readdir, readFile } from "fs/promises";
-import { join } from "path";
-
-// Index all skills from ~/.openclaw/skills/
-const skillsDir = join(process.env.HOME!, ".openclaw/skills");
-const files = await readdir(skillsDir, { recursive: true });
-
-const sources = await Promise.all(
-  files
-    .filter((f) => f.endsWith("SKILL.md"))
-    .map(async (file) => ({
-      content: await readFile(join(skillsDir, file), "utf-8"),
-      path: file,
-    }))
-);
-
-const engine = new ContextEngine();
-engine.indexSkills(sources);
-
-// Before each agent message
-const userMessage = "Deploy a Solana token on mainnet";
-const { prompt } = engine.inject(userMessage);
-
-// Prepend to system prompt
-const systemPrompt = `${prompt}\n\n${baseSystemPrompt}`;
-```
-
-## Complementary to QMD
-
-- **QMD** — Markdown document indexer (general docs, README, guides)
-- **@gicm/context** — Skill-specific indexer (OpenClaw SKILL.md files)
-
-Use both:
-
-- QMD for general documentation
-- @gicm/context for skills/workflows
-
-## Performance
-
-- **Indexing**: O(n) where n = total skill content length
-- **Injection**: O(m \* k) where m = skills, k = query words
-- **Memory**: ~4KB per skill (metadata only, content is indexed)
-
-Typical performance:
-
-- 50 skills, 200k tokens → Index in <50ms
-- Inject relevant context → <10ms
-
-## TypeScript
-
-Fully typed with strict mode:
-
-```typescript
-import type {
-  ContextConfig,
-  SkillEntry,
-  ScoredSkill,
-  InjectionResult,
-  ContextStats,
-} from "@gicm/context";
-```
-
-## Testing
+## Run it locally
 
 ```bash
-pnpm test
+pnpm install
+pnpm build   # tsup -> dist/
+pnpm test    # vitest (add --run for a single pass)
 ```
 
-30 comprehensive tests covering:
+## Status
 
-- Config validation
-- SKILL.md parsing
-- Relevance scoring
-- Context injection
-- Token budgets
-- Edge cases
-
-## License
-
-MIT © ICM Motion
+Beta. Version 1.0.0, a single extracted release (February 2026) with a test suite. The `excludePatterns` option is accepted but not used yet.
